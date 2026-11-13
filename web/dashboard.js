@@ -4,6 +4,9 @@
 import { trim, resample, metrics, smoothed, CM_PER_POINT } from "./curve.js";
 export { trim, resample, metrics };
 export const S = { strokes: new Map(), status: {}, summary: {}, device: {}, splits: new Map(), hrSeen: null };   // hrSeen: the last heart rate and when
+// Stroke records are keyed session-wide (decode.js's Session.key); saved rows from before that
+// change have no key of their own and fall back to the PM5's stroke count.
+const skey = s => s.key ?? s.stroke_count;
 // Characteristic 0x0043 is force against handle travel: each reading is 3.5/3 inches of the handle
 // moving away from the flywheel (Concept2, for RowErg models B to D). 0x003D is force against time.
 const handleCm = pts => { const t = trim(pts); return t ? t.length * CM_PER_POINT : null; };
@@ -73,7 +76,7 @@ function renderTiles() {
   $("tile_hr").classList.toggle("stale", lostS != null);
   setTile("peak", last ? `${n0(last.peak_force_lbf)}` : "—", last ? `lbf · average ${n0(last.avg_force_lbf)}` : "");
   setTile("drive", last ? `${n2(last.drive_length_m)} m` : "—", last ? `${n2(last.drive_time_s)} s` : "");
-  const prev = S.strokes.get(last && last.stroke_count - 1); const rec = last && (last.recovery_time_s ?? (prev && prev.recovery_time_s));
+  const prev = last ? S.strokes.get(skey(last) - 1) : null; const rec = last && (last.recovery_time_s ?? (prev && prev.recovery_time_s));
   setTile("ratio", last && rec ? `1 : ${n1(rec / last.drive_time_s)}` : "—", "target about 1 : 2");
   setTile("stroke", last ? `${n1(last.stroke_distance_m)} m` : "—", last ? `work ${n0(last.work_j)} J` : "");
   setTile("drag", n0(st.drag_factor), S.summary.drag_factor_avg ? `session ${S.summary.drag_factor_avg}` : "");
@@ -95,8 +98,8 @@ const school = () => SCHOOLS[$("school").value] || TARGETS;
 const bands = () => BANDS[$("bands").value] || null;
 function rememberChoices() { try { localStorage.setItem("pm5_choices", JSON.stringify({ ref: refKey(), school: $("school").value, bands: $("bands").value, smooth: $("smooth").value })); } catch {} }
 (function restoreChoices() { try { const c = JSON.parse(localStorage.getItem("pm5_choices")) || {}; for (const [id, k] of [["refsel", "ref"], ["school", "school"], ["bands", "bands"], ["smooth", "smooth"]]) if (c[k]) $(id).value = c[k]; } catch {} })();
-const strokesWithCurves = () => [...S.strokes.values()].filter(s => trim(pts(s))).sort((a, b) => a.stroke_count - b.stroke_count);
-const lastStroke = () => { const all = [...S.strokes.values()]; return all.length ? all.reduce((a, b) => b.stroke_count > a.stroke_count ? b : a) : null; };
+const strokesWithCurves = () => [...S.strokes.values()].filter(s => trim(pts(s))).sort((a, b) => skey(a) - skey(b));
+const lastStroke = () => { const all = [...S.strokes.values()]; return all.length ? all.reduce((a, b) => skey(b) > skey(a) ? b : a) : null; };
 
 let hoverX = null;
 function drawCurve() {
@@ -126,7 +129,7 @@ function drawCurve() {
   if (hoverX != null && cur) { const i = Math.round(Math.max(0, Math.min(100, (hoverX - pad.l) / pw * 100))); g.strokeStyle = css("--ink3"); g.beginPath(); g.moveTo(X(i), pad.t); g.lineTo(X(i), pad.t + ph); g.stroke();
     const r = resample(trim(pts(cur))); const ref = reference();
     $("hover").textContent = `${i}% of drive${lenCm ? ` (${Math.round(i / 100 * lenCm)} cm)` : ""} · this stroke ${n0(r[i])} lbf · average ${avg ? n0(avg[i] * scale) : "—"} · reference ${ref ? n0(ref[i] * scale) : "—"}`; }
-  else $("hover").textContent = cur ? `stroke ${cur.stroke_count}: hover the chart to read values` : "waiting for the first stroke…";
+  else $("hover").textContent = cur ? `stroke ${cur.stroke_count}${cur.piece > 1 ? ` (piece ${cur.piece})` : ""}: hover the chart to read values` : "waiting for the first stroke…";
 }
 $("curve").addEventListener("mousemove", e => { hoverX = e.offsetX; drawCurve(); });
 $("curve").addEventListener("mouseleave", () => { hoverX = null; drawCurve(); });
@@ -169,10 +172,10 @@ const TRENDS = [
 ];
 $("trends").innerHTML = TRENDS.map((t, i) => `<div class="panel" id="trend${i}"><h2>${t[0]}${t[2] ? ` <span style="font-weight:400;color:var(--ink3)">· shaded: target</span>` : ""}</h2><canvas id="tr${i}"></canvas></div>`).join("");
 function drawTrends() {
-  const list = [...S.strokes.values()].sort((a, b) => a.stroke_count - b.stroke_count);
+  const list = [...S.strokes.values()].sort((a, b) => skey(a) - skey(b));
   TRENDS.forEach(([name, fn, bandFn], i) => { const band = bandFn ? bandFn() : null;
     const c = $("tr" + i); const [g, w, h] = setupCanvas(c); const pad = { l: 34, r: 8, t: 6, b: 18 };
-    const pts = list.map(s => [s.stroke_count, fn(s)]).filter(p => p[1] != null && !Number.isNaN(p[1]));
+    const pts = list.map(s => [skey(s), fn(s)]).filter(p => p[1] != null && !Number.isNaN(p[1]));
     g.fillStyle = css("--ink3"); g.font = canvasFont();
     if (!pts.length) { g.fillText("no strokes yet", pad.l, h / 2); return; }
     let lo = Math.min(...pts.map(p => p[1])), hi = Math.max(...pts.map(p => p[1])); if (band) { lo = Math.min(lo, band.lo); hi = Math.max(hi, band.hi); }
@@ -191,15 +194,15 @@ function drawTrends() {
 
 function renderSplits() {
   const tb = $("splits"); if (!tb) return;
-  const list = [...S.splits.values()].sort((a, b) => a.split_number - b.split_number);
+  const list = [...S.splits.values()].sort((a, b) => (a.piece ?? 1) - (b.piece ?? 1) || a.split_number - b.split_number);
   tb.hidden = !list.length;
-  tb.querySelector("tbody").innerHTML = list.map(sp => `<tr><td>${sp.split_number}</td><td>${fmtTime(sp.split_time_s)}</td><td>${sp.split_distance_m ?? "—"}</td><td>${fmtPace(sp.split_pace_s)}</td><td>${sp.split_spm ?? "—"}</td><td>${sp.split_power_w ?? "—"}</td><td>${sp.split_hr ?? "—"}</td><td>${sp.split_drag ?? "—"}</td></tr>`).join("");
+  tb.querySelector("tbody").innerHTML = list.map(sp => `<tr><td>${sp.split_number}${(sp.piece ?? 1) > 1 ? ` (p${sp.piece})` : ""}</td><td>${fmtTime(sp.split_time_s)}</td><td>${sp.split_distance_m ?? "—"}</td><td>${fmtPace(sp.split_pace_s)}</td><td>${sp.split_spm ?? "—"}</td><td>${sp.split_power_w ?? "—"}</td><td>${sp.split_hr ?? "—"}</td><td>${sp.split_drag ?? "—"}</td></tr>`).join("");
 }
 
 function renderTable() {
-  const list = [...S.strokes.values()].sort((a, b) => b.stroke_count - a.stroke_count).slice(0, uiValue("rows"));
+  const list = [...S.strokes.values()].sort((a, b) => skey(b) - skey(a)).slice(0, uiValue("rows"));
   document.querySelector("#table tbody").innerHTML = list.map(s => { const m = metrics(pts(s)); const ratio = s.recovery_time_s && s.drive_time_s ? `1:${n1(s.recovery_time_s / s.drive_time_s)}` : "—";
-    return `<tr><td>${s.stroke_count}</td><td>${n2(s.drive_length_m)}</td><td>${n2(s.drive_time_s)}</td><td>${n2(s.recovery_time_s)}</td><td>${ratio}</td><td>${n2(s.stroke_distance_m)}</td><td>${n0(s.peak_force_lbf)}</td><td>${n0(s.avg_force_lbf)}</td><td>${n0(s.work_j)}</td><td>${n0(s.power_w)}</td><td>${m ? m.a100 + "%" : "—"}</td><td>${m ? n0(m.ram) + "%" : "—"}</td><td>${s.hr ? s.hr : "—"}</td></tr>`; }).join("");
+    return `<tr><td>${skey(s)}${s.piece > 1 ? ` (p${s.piece})` : ""}</td><td>${n2(s.drive_length_m)}</td><td>${n2(s.drive_time_s)}</td><td>${n2(s.recovery_time_s)}</td><td>${ratio}</td><td>${n2(s.stroke_distance_m)}</td><td>${n0(s.peak_force_lbf)}</td><td>${n0(s.avg_force_lbf)}</td><td>${n0(s.work_j)}</td><td>${n0(s.power_w)}</td><td>${m ? m.a100 + "%" : "—"}</td><td>${m ? n0(m.ram) + "%" : "—"}</td><td>${s.hr ? s.hr : "—"}</td></tr>`; }).join("");
 }
 
 let pending = false;
@@ -419,16 +422,16 @@ $("saveref").addEventListener("click", () => {
 
 // ---------- the event handlers the session feeds ----------
 export const H = {
-  snapshot: d => { S.hrSeen = null; S.strokes.clear(); d.strokes.forEach(s => S.strokes.set(s.stroke_count, s)); S.status = d.status || {}; S.summary = d.summary || {};
-    S.splits.clear(); (d.splits || []).forEach(sp => S.splits.set(sp.split_number, sp)); },
-  split: d => { S.splits.set(d.split_number, { ...d }); },
+  snapshot: d => { S.hrSeen = null; S.strokes.clear(); d.strokes.forEach(s => S.strokes.set(skey(s), s)); S.status = d.status || {}; S.summary = d.summary || {};
+    S.splits.clear(); (d.splits || []).forEach(sp => S.splits.set(`${sp.piece ?? 1}:${sp.split_number}`, sp)); },
+  split: d => { S.splits.set(`${d.piece ?? 1}:${d.split_number}`, { ...d }); },
   reset: d => { S.strokes.clear(); S.splits.clear(); S.status = {}; S.summary = {}; S.hrSeen = null; $("banner").textContent = d && d.replay ? `replaying ${d.replay}` : ""; },
   device: d => { S.device = d; $("banner").textContent = `${d.name || "PM5"}${d.firmware_rev ? " · firmware " + d.firmware_rev : ""}${d.workout ? " · " + d.workout : ""}`; },
   status: d => { S.status = d; if (d.hr) S.hrSeen = { hr: d.hr, at: Date.now() }; },
-  stroke: d => { S.strokes.set(d.stroke_count, d); },
-  stroke_update: d => { const s = S.strokes.get(d.stroke_count); if (s) Object.assign(s, d); },
-  curve: d => { const s = S.strokes.get(d.stroke_count); if (s) s[d.key] = d.points; },
+  stroke: d => { S.strokes.set(d.key ?? d.stroke_count, d); },
+  stroke_update: d => { const s = S.strokes.get(d.key ?? d.stroke_count); if (s) Object.assign(s, d); },
+  curve: d => { const s = S.strokes.get(d.key ?? d.stroke_count); if (s) s[d.kind] = d.points; },
   summary: d => { S.summary = d; },
-  new_piece: () => { $("banner").textContent = "a new piece started on the PM5: the last one has been saved"; },
+  piece: d => { $("banner").textContent = `a new piece started on the PM5: still logging (piece ${d.piece})`; },
   ended: d => { $("banner").textContent = `session ${d.session} saved in this browser`; },
 };

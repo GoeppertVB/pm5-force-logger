@@ -1,7 +1,7 @@
-// Recording and saving, one piece at a time, apart from the page so that it can be tested with a
-// stand-in store (tests/recorder.test.js). Three rules keep a row safe:
-//  - finishing a piece takes its session, metadata and raw log into its own hands before anything
-//    is awaited, so the next piece can start at once without either being misfiled;
+// Recording and saving, one whole session at a time, apart from the page so that it can be tested
+// with a stand-in store (tests/recorder.test.js). Three rules keep a row safe:
+//  - the session records straight through piece boundaries: intervals and Just Rows daisy-chained
+//    on the monitor are strokes in the same session, each tagged with its piece;
 //  - a save reports what it wrote, and hands back the row, so a failed write can still be
 //    downloaded from memory;
 //  - while a row is going its raw log is written every `checkpointS` seconds under the row's
@@ -13,12 +13,12 @@ export const CHECKPOINT_S = 60;
 
 export class Recorder {
   /** store: {putSession(data), putRaw(started, lines)} returning promises.
-   *  stamp(): the name of a piece starting now. onStart(meta): a piece has begun.
+   *  stamp(): the name of a session starting now. onStart(meta): a session has begun.
    *  fatigue(data): adds anything computed from the finished row before it is saved. */
   constructor({ store, stamp, emit = () => {}, onStart = () => {}, fatigue = d => d, checkpointS = CHECKPOINT_S }) {
     Object.assign(this, { store, stamp, emit, onStart, fatigue, checkpointS });
     this.session = null; this.raw = []; this.meta = {};
-    this.device = undefined; this.workout = undefined;   // carried into each piece
+    this.device = undefined; this.workout = undefined;   // carried into each session
     this.lastCheckpoint = null;
   }
 
@@ -30,22 +30,14 @@ export class Recorder {
     this.onStart(this.meta);
   }
 
-  /** One notification from the PM5. Returns {finishing} (the old piece's save) when this packet
-   *  showed that a new piece had started; the new piece is already recording it. */
+  /** One notification from the PM5. */
   packet(t, short, b) {
     const line = { t: Math.round(t * 1000) / 1000, uuid: short.toString(16).padStart(4, "0"), hex: bytesToHex(b) };
-    if (!this.session) {            // between pieces: nothing is kept until the next stroke
+    if (!this.session) {            // after a save: nothing is kept until the next stroke
       if (short !== 0x0035) return {};
       this.start();
     }
     this.session.feed(t, short, b);
-    if (this.session.newPieceAt !== null) {
-      const finishing = this.finish();
-      this.start();
-      this.raw.push(line);
-      this.session.feed(t, short, b);
-      return { finishing };
-    }
     this.raw.push(line);
     if (this.session.strokes.size && (this.lastCheckpoint === null || t - this.lastCheckpoint >= this.checkpointS)) {
       this.lastCheckpoint = t;
@@ -64,11 +56,11 @@ export class Recorder {
     return [{ t: raw.length ? raw[0].t : Math.round(Date.now() / 1000), device: meta.device || null, workout: meta.workout || null }, ...raw];
   }
 
-  /** Save the current piece, if it has strokes. Resolves to null (nothing to save) or
+  /** Save the current session, if it has strokes. Resolves to null (nothing to save) or
    *  {id, data, lines, saved: "all" | "session" | "none", error}: the row itself comes back, so
    *  whatever was not written can still be downloaded. */
   async finish() {
-    const session = this.session, meta = this.meta, raw = this.raw;   // this piece's, whatever starts next
+    const session = this.session, meta = this.meta, raw = this.raw;
     this.session = null;
     if (!session || !session.strokes.size) return null;
     const id = meta.started, data = this.fatigue(session.result(meta)), lines = this.lines(meta, raw);

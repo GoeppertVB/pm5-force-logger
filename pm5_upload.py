@@ -190,8 +190,10 @@ def upload_session(path, dry_run: bool = False):
     if sess.get("logbook_id"):
         print(f"already in the Logbook as result {sess['logbook_id']}")
         return sess["logbook_id"]
-    if sess.get("new_piece_started"):
-        print("note: a second piece started during this run; only the first piece is in this file")
+    if sess.get("pieces", 1) > 1:
+        print(f"note: this session holds {sess['pieces']} pieces (interval workout or daisy-chained "
+              "Just Rows); the Logbook takes one piece per row, so nothing was posted")
+        return None
     payload = build_payload(sess)
     print(f"Logbook: {payload['distance']} m in {payload['time'] / 10:.1f} s, "
           f"{len(payload['stroke_data'])} strokes, dated {payload['date']} {payload['timezone']}")

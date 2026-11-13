@@ -191,29 +191,76 @@ class SessionTests(unittest.TestCase):
         s.feed(75.0, 0x0035, stroke_packet(2, 65.0, 7.0, recovery_s=62.0))   # the rower stopped for a minute
         s.feed(76.0, 0x0035, stroke_packet(3, 66.0, 9.0, recovery_s=62.0))
         r = s.result({})
-        self.assertFalse(r["new_piece_started"])
+        self.assertEqual(r["pieces"], 1)
         self.assertEqual([x["stroke_count"] for x in r["strokes"]], [1, 2, 3])
         self.assertEqual(r["strokes"][1]["recovery_time_s"], 62.0)
 
-    def test_a_second_piece_is_detected_and_kept_out(self):
+    def test_a_second_piece_is_logged_and_tagged(self):
         s = L.Session()
         for n in range(1, 6):
             s.feed(10.0 + n, 0x0035, stroke_packet(n, n * 1.0, n * 2.0))
         s.feed(100.0, 0x0035, stroke_packet(1, 1.2, 2.1))       # counts restart: a new piece
         s.feed(101.0, 0x0035, stroke_packet(2, 2.4, 4.2))
         r = s.result({})
-        self.assertTrue(r["new_piece_started"])
-        self.assertEqual([x["stroke_count"] for x in r["strokes"]], [1, 2, 3, 4, 5])
+        self.assertEqual(r["pieces"], 2)
+        self.assertEqual([x["stroke_count"] for x in r["strokes"]], [1, 2, 3, 4, 5, 1, 2])
+        self.assertEqual([x["piece"] for x in r["strokes"]], [1, 1, 1, 1, 1, 2, 2])
+        self.assertEqual([x["key"] for x in r["strokes"]], [1, 2, 3, 4, 5, 6, 7], "records keep their arrival order")
         self.assertEqual(r["strokes"][0]["distance_m"], 2.0, "the first piece's stroke 1 is untouched")
+
+    def test_daisy_chained_just_rows_form_one_session(self):
+        s = L.Session()
+        end = le(0, 2) + le(0, 2) + le(3000, 3) + le(5000, 3) + bytes([22, 155, 142, 67, 162, 115, 0, 0]) + le(1300, 2)
+        for n in range(1, 4):
+            s.feed(10.0 + n, 0x0035, stroke_packet(n, n * 1.0, n * 2.0))
+            s.feed(20.0, 0x0039, end)                     # the piece ended on the monitor
+        s.feed(30.0, 0x0035, stroke_packet(1, 1.2, 2.1))  # a second Just Row, 90 s later
+        s.feed(31.0, 0x0035, stroke_packet(2, 2.4, 4.2))
+        r = s.result({})
+        self.assertEqual(r["pieces"], 2)
+        self.assertEqual(len(r["strokes"]), 5, "every stroke of both pieces is in the session")
+        self.assertEqual([x["piece"] for x in r["strokes"]], [1, 1, 1, 2, 2])
+        self.assertIsNone(s.end_at, "strokes after a summary clear the end, so the recording carries on")
+        self.assertEqual(r["summary"]["received_at"], 20.0, "the first summary's timestamp is kept")
+
+    def test_interval_workout_keeps_logging_through_the_rests(self):
+        s = L.Session()
+        status = lambda t, state: le(int(t * 100), 3) + le(1234, 3) + bytes([5, 0, 1, state, 1]) + le(0, 3) + le(45000, 3) + bytes([0x00, 113])
+        end = le(0, 2) + le(0, 2) + le(45000, 3) + le(5000, 3) + bytes([30, 155, 142, 67, 162, 115, 0, 0]) + le(1100, 2)
+        for interval in range(1, 4):   # 3 x 45" with rest, as the PM5 paces them
+            s.feed(interval * 100.0, 0x0031, status(interval * 100.0, 4))   # interval_work_time
+            for n in range(1, 6):
+                s.feed(interval * 100.0 + n, 0x0035, stroke_packet(n, n * 1.0, n * 2.0))
+            s.feed(interval * 100.0 + 50.0, 0x0031, status(interval * 100.0 + 50.0, 3))   # interval_rest
+            s.feed(interval * 100.0 + 51.0, 0x0039, end)
+        r = s.result({})
+        self.assertEqual(r["pieces"], 3)
+        self.assertEqual(len(r["strokes"]), 15)
+        self.assertEqual([x["piece"] for x in r["strokes"]], [1] * 5 + [2] * 5 + [3] * 5)
+        self.assertEqual(len(r["splits"]), 0, "no split summaries in this stream, so none invented")
+
+    def test_a_curve_near_a_later_piece_still_attaches(self):
+        s = L.Session()
+        s.feed(10.0, 0x0035, stroke_packet(1, 1.2, 2.1, peak=64))
+        s.feed(12.0, 0x0035, stroke_packet(2, 2.8, 5.9, recovery_s=0.6))
+        s.feed(100.0, 0x0035, stroke_packet(1, 1.2, 2.1, peak=90))   # a second piece begins
+        for pk in curve_packets([10, 50, 90, 50, 10]):
+            s.feed(100.01, 0x003D, pk)
+        strokes = s.result({})["strokes"]
+        self.assertEqual(len(strokes), 3)
+        self.assertEqual(strokes[2]["force_curve"], [10, 50, 90, 50, 10], "attached to the second piece's stroke")
+        self.assertNotIn("force_curve", strokes[0], "the first piece's stroke keeps its own curve, or none")
 
     def test_summary_sets_end_time_once(self):
         s = L.Session()
         b = (le(0, 2) + le(0, 2) + le(131930, 3) + le(50090, 3) + bytes([22, 155, 142, 67, 162, 115, 0, 0]) + le(1300, 2))
         s.feed(500.0, 0x0039, b)
         s.feed(560.0, 0x0039, b[:16] + bytes([95]) + b[17:])   # re-sent with recovery HR
-        self.assertEqual(s.end_at, 500.0)
+        self.assertEqual(s.end_at, 560.0, "the latest summary holds the end, for the recovery heart rate")
         self.assertEqual(s.summary["recovery_hr"], 95)
         self.assertEqual(s.summary["received_at"], 500.0)
+        s.feed(570.0, 0x0035, stroke_packet(2, 66.0, 9.0))
+        self.assertIsNone(s.end_at, "a stroke after the summary means the session carries on")
 
 
 class ReparseKeepsAnnotationsTests(unittest.TestCase):

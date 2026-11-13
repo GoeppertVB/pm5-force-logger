@@ -17,10 +17,10 @@ saves all of it and shows it live in a browser.
 Before recording: close ErgData (or any other rowing app) and wake the PM5. The PM5 accepts
 one app connection at a time and stops advertising while anything holds it.
 
-Recording stops 75 s after the PM5's end-of-workout summary (which it re-sends with the
-recovery heart rate after a minute), 10 min after the last stroke, when a second piece is
-started on the monitor, or on Ctrl+C. Every stop saves the session. One piece per run: if a
-second piece starts, the first is saved and the logger exits; run it again for the next.
+The recording is session-scoped: interval workouts and Just Row pieces daisy-chained on the
+monitor are logged into one session, each stroke tagged with its piece. Piece boundaries and
+end-of-piece summaries are logged and the recording carries on. Recording stops 10 min after
+the last stroke, when the PM5 disconnects, or on Ctrl+C. Every stop saves the session.
 
 On macOS, run it from Terminal (or iTerm). macOS kills a process that uses Bluetooth under an
 app without Bluetooth permission (you'll see exit code 134, "abort"); Terminal asks for the
@@ -61,7 +61,6 @@ ROWING_SERVICE = UUID(0x0030)
 DEVICE_INFO = {0x0011: "model", 0x0012: "serial", 0x0013: "hardware_rev",
                0x0014: "firmware_rev", 0x0015: "manufacturer"}
 IDLE_STOP_S = 600          # stop 10 min after the last stroke (the PM5 sends status every second while awake)
-AFTER_END_S = 75           # the PM5 re-sends its summary with recovery HR after 1 min of rest
 FEEL_WAIT_S = 180          # after a readiness check, how long the dashboard stays up for how it felt
 CURVE_MATCH_S = 3.0        # a force curve belongs to the stroke record within this many seconds
 MAX_BODY_BYTES = 64 * 1024  # the dashboard's own POST is a few dozen bytes; nothing larger is read
@@ -172,23 +171,25 @@ class Session:
 
     Stroke data (0x0035) arrives twice per stroke: at the end of the drive, and again at the end
     of the recovery with that stroke's recovery time (the first copy carries the previous
-    stroke's). Records are keyed on stroke count; count 0 is the reset at a workout's start or
-    end and is dropped. Force curves come on two channels: 0x003D (documented; time-stepped, so
-    each reading repeats 2-3 times, with leading zeros) and 0x0043 (not in spec rev 1.30, sent by
-    2026 firmware just after 0x003D; same packet scheme, one point per reading).
+    stroke's). Records are keyed on a session-wide key in arrival order — the PM5's own stroke
+    count is kept per record, but it restarts whenever a new piece begins (the next interval of a
+    programmed workout, or another Just Row daisy-chained on the monitor), so a count that has
+    already been seen is either that stroke's second copy or a piece boundary: boundaries only
+    move the piece index forward and never stop the recording. A count of 0 is the reset at a
+    workout's start or end and is dropped. Force curves come on two channels: 0x003D (documented;
+    time-stepped, so each reading repeats 2-3 times, with leading zeros) and 0x0043 (not in spec
+    rev 1.30, sent by 2026 firmware just after 0x003D; same packet scheme, one point per reading).
 
-    A session holds one piece. Stroke counts restart at 1 when a new piece starts on the
-    monitor, so a count that has already been recorded and is below the latest one means a new
-    piece: `new_piece_at` is set and further strokes are ignored (the raw log still has them).
-    A count equal to the latest, however late, is the second copy of that stroke: a rower who
-    pauses mid-piece produces exactly that. `emit(kind, data)` feeds the live dashboard."""
+    The recording ends only when the rower ends it: a piece boundary and the end-of-workout
+    summary are logged and the session carries on. `emit(kind, data)` feeds the live dashboard."""
 
     CURVES = {0x003D: "force_curve", 0x0043: "force_curve_v2"}
 
     def __init__(self, echo=False, emit=None):
         self.strokes, self.unmatched, self.summary, self.status, self.splits = {}, [], {}, {}, {}
         self.fc = {k: ForceCurve() for k in self.CURVES}
-        self.max_count, self.last_stroke_t, self.end_at, self.new_piece_at = 0, None, None, None
+        self._key, self.piece, self.piece_counts, self.max_count = 0, 0, {}, 0
+        self.last_stroke_t, self.end_at = None, None
         self.echo, self.emit = echo, emit or (lambda kind, data: None)
 
     def feed(self, t: float, short: int, b: bytes):
@@ -204,9 +205,10 @@ class Session:
             self._stroke(t, p)
             return
         if short == 0x0036:
-            if p["stroke_count"] in self.strokes and self.new_piece_at is None:
-                self.strokes[p["stroke_count"]]["power_w"] = p["power_w"]
-                self.emit("stroke_update", {"stroke_count": p["stroke_count"], "power_w": p["power_w"]})
+            rec = self.piece_counts.get(p["stroke_count"])
+            if rec and "power_w" not in rec:
+                rec["power_w"] = p["power_w"]
+                self.emit("stroke_update", {"key": rec["key"], "stroke_count": p["stroke_count"], "power_w": p["power_w"]})
             self.status.update(power_w=p["power_w"], projected_time_s=p.get("projected_time_s"),
                                projected_distance_m=p.get("projected_distance_m"))
         elif short == 0x0032:
@@ -219,8 +221,9 @@ class Session:
         elif short == 0x0033:
             self.status.update(avg_power_w=p["avg_power_w"], calories_total=p["calories_total"])
         elif short in (0x0037, 0x0038):
-            if self.new_piece_at is None and p["split_number"]:
-                sp = self.splits.setdefault(p["split_number"], {"split_number": p["split_number"]})
+            if p["split_number"]:
+                sp = self.splits.setdefault((self.piece, p["split_number"]),
+                                            {"piece": self.piece, "split_number": p["split_number"]})
                 sp.update({k: v for k, v in p.items() if k != "elapsed_s"}, end_s=p["elapsed_s"])
                 self.emit("split", sp)
             return
@@ -235,66 +238,75 @@ class Session:
         elif short == 0x0039:
             self.summary.update(p)
             self.summary.setdefault("received_at", round(t, 3))  # the Logbook dates a row by its end
-            self.end_at = self.end_at or t
+            self.end_at = t   # the piece ended; cleared again by the next stroke (daisy-chained pieces)
             self.emit("summary", self.summary)
             if self.echo:
-                print(f"end of workout: {p['distance_m']} m in {p['elapsed_s']} s, "
-                      f"drag {p['drag_factor_avg']}, recovery HR {p['recovery_hr']}", flush=True)
+                print(f"end of piece: {p['distance_m']} m in {p['elapsed_s']} s, "
+                      f"drag {p['drag_factor_avg']}, recovery HR {p['recovery_hr']} — logging continues", flush=True)
             return
         self.emit("status", self.status)
 
+    def _boundary(self, t):
+        """A piece boundary: the next interval of a programmed workout, or another Just Row started
+        on the monitor. The recording carries on; later strokes are tagged with the next piece."""
+        self.piece_counts, self.max_count = {}, 0
+
     def _stroke(self, t: float, p: dict):
         n = p["stroke_count"]
-        if n == 0 or self.new_piece_at is not None:
+        if n == 0:
             return
         self.last_stroke_t = t
-        if n in self.strokes:
-            if n < self.max_count - 1:   # counts went backwards: the PM5 started a new piece
-                self.new_piece_at = t
-                self.emit("new_piece", {"t": round(t, 3)})
-                if self.echo:
-                    print("a new piece started on the PM5. This run records one piece, so the first is "
-                          "being saved now; run the logger again for the next.", flush=True)
-                return
-            self.strokes[n]["recovery_time_s"] = p["recovery_time_s"]
-            self.emit("stroke_update", {"stroke_count": n, "recovery_time_s": p["recovery_time_s"]})
+        self.end_at = None    # strokes resumed after a summary: the session carries on
+        if n == 1 and len(self.piece_counts) > 1:          # a fresh piece on the monitor
+            self._boundary(t)
+            self.emit("piece", {"t": round(t, 3), "piece": self.piece + 1})
+        elif n in self.piece_counts and n < self.max_count - 1:   # counts went backwards: a new piece
+            self._boundary(t)
+            self.emit("piece", {"t": round(t, 3), "piece": self.piece + 1})
+        if n in self.piece_counts:    # the second copy of a stroke, with its recovery time
+            rec = self.piece_counts[n]
+            rec["recovery_time_s"] = p["recovery_time_s"]
+            self.emit("stroke_update", {"key": rec["key"], "stroke_count": n, "recovery_time_s": p["recovery_time_s"]})
             return
+        if not self.piece_counts:     # the first stroke of a piece
+            self.piece += 1
+        self._key += 1
+        s = {"key": self._key, "t": round(t, 3), "piece": self.piece, **p, "hr": self.status.get("hr"),
+             "spm": self.status.get("stroke_rate"), "pace_s": self.status.get("pace_s"),
+             "recovery_time_s": None}   # filled by this stroke's second copy
+        self.strokes[self._key] = s
+        self.piece_counts[n] = s
         self.max_count = max(self.max_count, n)
-        s = self.strokes[n] = {"t": round(t, 3), **p, "hr": self.status.get("hr"),
-                               "spm": self.status.get("stroke_rate"), "pace_s": self.status.get("pace_s"),
-                               "recovery_time_s": None}   # filled by this stroke's second copy
         for c in list(self.unmatched):   # a curve that arrived just before its stroke record
             if c["kind"] not in s and abs(c["t"] - t) < CURVE_MATCH_S:
                 s[c["kind"]] = c["points"]
                 self.unmatched.remove(c)
         self.emit("stroke", s)
         if self.echo:
-            print(f"stroke {n:4d}  {p['distance_m']:7.1f} m  peak {p['peak_force_lbf']:5.1f} lbf  "
-                  f"drive {p['drive_length_m']:.2f} m / {p['drive_time_s']:.2f} s", flush=True)
+            print(f"stroke {self._key:4d} (piece {self.piece}, count {n:3d})  {p['distance_m']:7.1f} m  "
+                  f"peak {p['peak_force_lbf']:5.1f} lbf  drive {p['drive_length_m']:.2f} m / {p['drive_time_s']:.2f} s", flush=True)
 
     def _attach_curve(self, t, key, points):
-        if self.new_piece_at is not None:
-            return
         # each curve arrives just after its drive, beside that stroke's first 0x0035
         free = [s for s in self.strokes.values() if key not in s and abs(s["t"] - t) < CURVE_MATCH_S]
         if free:
             s = min(free, key=lambda s: abs(s["t"] - t))
             s[key] = points
-            self.emit("curve", {"stroke_count": s["stroke_count"], "key": key, "points": points})
+            self.emit("curve", {"key": s["key"], "stroke_count": s["stroke_count"], "kind": key, "points": points})
         else:
             self.unmatched.append({"kind": key, "t": round(t, 3), "points": points})
 
     def snapshot(self) -> dict:
         return {"status": self.status, "summary": self.summary,
-                "strokes": [self.strokes[k] for k in sorted(self.strokes)],
+                "strokes": list(self.strokes.values()),
                 "splits": [self.splits[k] for k in sorted(self.splits)]}
 
     def result(self, meta: dict) -> dict:
         return {**meta, "last_status": self.status, "summary": self.summary,
-                "strokes": [self.strokes[k] for k in sorted(self.strokes)],
+                "strokes": list(self.strokes.values()),
                 "splits": [self.splits[k] for k in sorted(self.splits)],
                 "unmatched_curves": self.unmatched,
-                "new_piece_started": self.new_piece_at is not None}
+                "pieces": self.piece}
 
 
 def content_length(header: bytes):
@@ -746,10 +758,6 @@ async def log_session(minutes: float | None, upload: bool = True, open_browser: 
                 while client.is_connected and not stop.is_set():
                     await asyncio.sleep(1)
                     now = time.time()
-                    if session.end_at and now - session.end_at > AFTER_END_S:
-                        break
-                    if session.new_piece_at:
-                        break
                     if now - (session.last_stroke_t or connected_at) > IDLE_STOP_S:
                         print("no strokes for 10 minutes; stopping", flush=True)
                         break

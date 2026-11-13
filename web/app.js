@@ -2,7 +2,7 @@
 // dashboard, programs workouts, saves finished rows in the browser and shows the fitness report.
 // Served by the Python logger instead, it leaves the PM5 and the saving to the logger and
 // follows the logger's events (logger-feed.js).
-import { Session, readRaw, AFTER_END_S, parse } from "./decode.js";
+import { Session, readRaw, parse } from "./decode.js";
 import * as C from "./csafe.js";
 import * as V from "./vo2.js";
 import * as BLE from "./ble.js";
@@ -19,7 +19,7 @@ import * as Count from "./count.js";
 import * as Files from "./files.js";
 
 const $ = id => document.getElementById(id);
-const state = { pm: null, endTimer: null, sample: false, named: {}, lastSaved: null, logger: null, unsaved: new Map(), fileTrouble: new Map() };
+const state = { pm: null, sample: false, named: {}, lastSaved: null, logger: null, unsaved: new Map(), fileTrouble: new Map() };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function stamp(d = new Date()) {
@@ -39,15 +39,7 @@ const recording = () => !!(rec.session && rec.session.strokes.size);
 
 function onPacket(t, short, b) {
   if (short === 0x003b) { const p = parse(short, b); if (p && p.hrm_id) rememberHrm({ mfg: p.hrm_mfg, type: p.hrm_type, id: p.hrm_id }, "paired with"); }
-  const { finishing } = rec.packet(t, short, b);
-  if (finishing) {                      // the PM5 started a new piece: the recorder is saving the old one and recording the new
-    clearTimeout(state.endTimer); state.endTimer = null;
-    finishing.then(out => afterSave(out, "a new piece started on the PM5"));
-  }
-  if (rec.session && rec.session.endAt !== null && !state.endTimer) {
-    setConn(`piece ended on the PM5; saving in ${AFTER_END_S} s (it re-sends its summary with the recovery heart rate)`, "live");
-    state.endTimer = setTimeout(() => saveRow("the piece ended on the PM5"), AFTER_END_S * 1000);
-  }
+  rec.packet(t, short, b);   // piece boundaries and end-of-piece summaries are logged, not acted on: the session carries on
 }
 
 /** When peak position started drifting later, if it did: saved with every row. */
@@ -56,9 +48,8 @@ function withFatigue(data) {
   return data;
 }
 
-/** Save the current piece (if it has strokes) and leave the dashboard showing it. */
+/** Save the current session (if it has strokes) and leave the dashboard showing it. */
 async function saveRow(reason) {
-  clearTimeout(state.endTimer); state.endTimer = null;
   // a guided session still running (Stop pressed, or the PM5 gone) ends with the row, so its
   // report goes into the row's files and onto the Finished screen
   if (guided.running && !guided.sim) await guided.finish(true);
@@ -173,7 +164,7 @@ async function connect() {
   rec.start();
   updateWake();
   syncHeartRateMonitor();
-  setConn(`live: ${state.pm.info.name}${state.pm.info.firmware_rev ? ", firmware " + state.pm.info.firmware_rev : ""}. Row when ready; end the piece on the PM5 (Menu)`, "live");
+  setConn(`live: ${state.pm.info.name}${state.pm.info.firmware_rev ? ", firmware " + state.pm.info.firmware_rev : ""}. Row when ready; press Stop when you're done`, "live");
 }
 
 async function onDisconnected() {
@@ -450,11 +441,11 @@ function useLogger(info) {
   }).catch(() => { /* the page still works without the list */ });
   Logger.follow((kind, data) => {
     emit(kind, data);
-    if (kind === "new_piece") $("banner").textContent = "a new piece started on the PM5: the logger is saving this one; run it again for the next piece";
+    if (kind === "piece") $("banner").textContent = `a new piece started on the PM5: still logging (piece ${data.piece})`;
     if (kind === "ended") {
       $("banner").textContent = info.replay ? `replay of ${data.session} finished (a replay is not saved)` : `session ${data.session} saved by the logger`;
       // the row as the logger saves it, with the guided report (a step test's stages) and the piece set on the monitor
-      const row = { strokes: [...S.strokes.values()].sort((a, b) => a.stroke_count - b.stroke_count), summary: S.summary, splits: [...S.splits.values()],
+      const row = { strokes: [...S.strokes.values()].sort((a, b) => (a.key ?? a.stroke_count) - (b.key ?? b.stroke_count)), summary: S.summary, splits: [...S.splits.values()],
         ...(state.logger.guided ? { guided: state.logger.guided } : {}), ...(S.device && S.device.workout ? { workout: S.device.workout } : {}) };
       state.logger.guided = null;
       showFitness([[data.session, row]]);

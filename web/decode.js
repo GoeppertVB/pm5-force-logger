@@ -10,7 +10,6 @@ export const CONTROL_SERVICE = uuid(0x0020);
 export const ROWING_SERVICE = uuid(0x0030);
 export const DEVICE_INFO = { 0x0011: "model", 0x0012: "serial", 0x0013: "hardware_rev", 0x0014: "firmware_rev", 0x0015: "manufacturer" };
 export const CURVE_MATCH_S = 3.0;   // a force curve belongs to the stroke record within this many seconds
-export const AFTER_END_S = 75;      // the PM5 re-sends its summary with the recovery heart rate after a minute
 export const WORKOUT_STATE = {
   0: "wait_to_begin", 1: "workout_row", 2: "countdown_pause", 3: "interval_rest", 4: "interval_work_time",
   5: "interval_work_distance", 6: "interval_rest_end_to_work_time", 7: "interval_rest_end_to_work_distance",
@@ -106,14 +105,17 @@ export class ForceCurve {
 const CURVES = { 0x003d: "force_curve", 0x0043: "force_curve_v2" };
 
 /** Turns a stream of (arrival time, characteristic, bytes) into one record per stroke.
- *  Same rules as the Python Session: stroke data arrives twice per stroke, records are keyed on
- *  stroke count, count 0 is dropped, a count that goes backwards means a new piece started on the
- *  monitor (newPieceAt is set and further strokes are ignored), and emit(kind, data) feeds the page. */
+ *  Same rules as the Python Session: stroke data arrives twice per stroke, records are keyed on a
+ *  session-wide key in arrival order (the PM5's own stroke count is kept per record, and restarts
+ *  whenever a new piece begins, so a count that has already been seen is either that stroke's
+ *  second copy or a piece boundary), count 0 is dropped, and a piece boundary only moves the piece
+ *  index forward — the recording never stops on one. emit(kind, data) feeds the page. */
 export class Session {
   constructor(emit) {
     this.strokes = new Map(); this.unmatched = []; this.summary = {}; this.status = {}; this.splits = new Map();
     this.fc = { 0x003d: new ForceCurve(), 0x0043: new ForceCurve() };
-    this.maxCount = 0; this.lastStrokeT = null; this.endAt = null; this.newPieceAt = null;
+    this.key = 0; this.piece = 0; this.pieceCounts = new Map(); this.maxCount = 0;
+    this.lastStrokeT = null; this.endAt = null;
     this.emit = emit || (() => {});
   }
 
@@ -127,9 +129,10 @@ export class Session {
     if (!p) return;
     if (short === 0x0035) { this._stroke(t, p); return; }
     if (short === 0x0036) {
-      if (this.strokes.has(p.stroke_count) && this.newPieceAt === null) {
-        this.strokes.get(p.stroke_count).power_w = p.power_w;
-        this.emit("stroke_update", { stroke_count: p.stroke_count, power_w: p.power_w });
+      const rec = this.pieceCounts.get(p.stroke_count);
+      if (rec && rec.power_w === undefined) {
+        rec.power_w = p.power_w;
+        this.emit("stroke_update", { key: rec.key, stroke_count: p.stroke_count, power_w: p.power_w });
       }
       Object.assign(this.status, { power_w: p.power_w, projected_time_s: p.projected_time_s ?? null, projected_distance_m: p.projected_distance_m ?? null });
     } else if (short === 0x0032) {
@@ -140,11 +143,12 @@ export class Session {
     } else if (short === 0x0033) {
       Object.assign(this.status, { avg_power_w: p.avg_power_w, calories_total: p.calories_total });
     } else if (short === 0x0037 || short === 0x0038) {
-      if (this.newPieceAt === null && p.split_number) {
-        const sp = this.splits.get(p.split_number) || { split_number: p.split_number };
+      if (p.split_number) {
+        const sk = `${this.piece}:${p.split_number}`;
+        const sp = this.splits.get(sk) || { piece: this.piece, split_number: p.split_number };
         const { elapsed_s, ...rest } = p;
         Object.assign(sp, rest, { end_s: elapsed_s });
-        this.splits.set(p.split_number, sp);
+        this.splits.set(sk, sp);
         this.emit("split", sp);
       }
       return;
@@ -159,31 +163,43 @@ export class Session {
     } else if (short === 0x0039) {
       Object.assign(this.summary, p);
       if (this.summary.received_at === undefined) this.summary.received_at = round3(t);   // the Logbook dates a row by its end
-      this.endAt = this.endAt ?? t;
+      this.endAt = t;   // the piece ended; cleared again by the next stroke (daisy-chained pieces)
       this.emit("summary", this.summary);
       return;
     }
     this.emit("status", this.status);
   }
 
+  _boundary() {
+    // a piece boundary: the next interval of a programmed workout, or another Just Row started on
+    // the monitor. The recording carries on; later strokes are tagged with the next piece.
+    this.pieceCounts = new Map(); this.maxCount = 0;
+  }
+
   _stroke(t, p) {
     const n = p.stroke_count;
-    if (n === 0 || this.newPieceAt !== null) return;
+    if (n === 0) return;
     this.lastStrokeT = t;
-    if (this.strokes.has(n)) {
-      if (n < this.maxCount - 1) {   // counts went backwards: the PM5 started a new piece
-        this.newPieceAt = t;
-        this.emit("new_piece", { t: round3(t) });
-        return;
-      }
-      this.strokes.get(n).recovery_time_s = p.recovery_time_s;
-      this.emit("stroke_update", { stroke_count: n, recovery_time_s: p.recovery_time_s });
+    this.endAt = null;   // strokes resumed after a summary: the session carries on
+    if (n === 1 && this.pieceCounts.size > 1) {           // a fresh piece on the monitor
+      this._boundary();
+      this.emit("piece", { t: round3(t), piece: this.piece + 1 });
+    } else if (this.pieceCounts.has(n) && n < this.maxCount - 1) {   // counts went backwards: a new piece
+      this._boundary();
+      this.emit("piece", { t: round3(t), piece: this.piece + 1 });
+    }
+    if (this.pieceCounts.has(n)) {   // the second copy of a stroke, with its recovery time
+      const rec = this.pieceCounts.get(n);
+      rec.recovery_time_s = p.recovery_time_s;
+      this.emit("stroke_update", { key: rec.key, stroke_count: n, recovery_time_s: p.recovery_time_s });
       return;
     }
+    if (!this.pieceCounts.size) this.piece++;   // the first stroke of a piece
+    const s = { key: ++this.key, t: round3(t), piece: this.piece, ...p, hr: this.status.hr ?? null,
+      spm: this.status.stroke_rate ?? null, pace_s: this.status.pace_s ?? null, recovery_time_s: null };
+    this.strokes.set(s.key, s);
+    this.pieceCounts.set(n, s);
     this.maxCount = Math.max(this.maxCount, n);
-    const s = { t: round3(t), ...p, hr: this.status.hr ?? null, spm: this.status.stroke_rate ?? null,
-      pace_s: this.status.pace_s ?? null, recovery_time_s: null };   // filled by this stroke's second copy
-    this.strokes.set(n, s);
     for (const c of [...this.unmatched]) {   // a curve that arrived just before its stroke record
       if (!(c.kind in s) && Math.abs(c.t - t) < CURVE_MATCH_S) {
         s[c.kind] = c.points;
@@ -194,24 +210,23 @@ export class Session {
   }
 
   _attachCurve(t, key, points) {
-    if (this.newPieceAt !== null) return;
     // each curve arrives just after its drive, beside that stroke's first 0x0035
     const free = [...this.strokes.values()].filter(s => !(key in s) && Math.abs(s.t - t) < CURVE_MATCH_S);
     if (free.length) {
       const s = free.reduce((a, b) => Math.abs(b.t - t) < Math.abs(a.t - t) ? b : a);
       s[key] = points;
-      this.emit("curve", { stroke_count: s.stroke_count, key, points });
+      this.emit("curve", { key: s.key, stroke_count: s.stroke_count, kind: key, points });
     } else {
       this.unmatched.push({ kind: key, t: round3(t), points });
     }
   }
 
-  sortedStrokes() { return [...this.strokes.keys()].sort((a, b) => a - b).map(k => this.strokes.get(k)); }
-  snapshot() { return { status: this.status, summary: this.summary, strokes: this.sortedStrokes(), splits: [...this.splits.values()].sort((a, b) => a.split_number - b.split_number) }; }
+  sortedStrokes() { return [...this.strokes.values()]; }
+  sortedSplits() { return [...this.splits.values()].sort((a, b) => a.piece - b.piece || a.split_number - b.split_number); }
+  snapshot() { return { status: this.status, summary: this.summary, strokes: this.sortedStrokes(), splits: this.sortedSplits() }; }
   result(meta) {
     return { ...meta, last_status: this.status, summary: this.summary, strokes: this.sortedStrokes(),
-      splits: [...this.splits.keys()].sort((a, b) => a - b).map(k => this.splits.get(k)),
-      unmatched_curves: this.unmatched, new_piece_started: this.newPieceAt !== null };
+      splits: this.sortedSplits(), unmatched_curves: this.unmatched, pieces: this.piece };
   }
 }
 

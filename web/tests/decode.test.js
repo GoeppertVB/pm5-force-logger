@@ -44,12 +44,12 @@ test("the synthetic sample row assembles into the same session as the Python log
   assert.deepEqual(got.summary, expected.summary);
   assert.deepEqual(got.last_status, expected.last_status);
   assert.deepEqual(got.unmatched_curves.map(c => c.kind), expected.unmatched_curves.map(c => c.kind));
-  assert.equal(got.new_piece_started, expected.new_piece_started);
+  assert.equal(got.pieces, expected.pieces);
   assert.equal(got.device.serial, expected.device.serial);
   assert.ok(kinds.includes("stroke") && kinds.includes("curve") && kinds.includes("summary"));
 });
 
-test("a stroke count that goes backwards marks a new piece and later strokes are ignored", () => {
+test("a stroke count that goes backwards tags a new piece and the session carries on", () => {
   const le = (v, n) => Array.from({ length: n }, (_, i) => (v >> (8 * i)) & 0xff);
   const stroke = (n, t) => Uint8Array.from([...le(t * 100, 3), ...le(t * 30, 3), 140, 80, ...le(200, 2), ...le(950, 2), ...le(1000, 2), ...le(500, 2), ...le(4000, 2), ...le(n, 2)]);
   const events = [];
@@ -58,11 +58,48 @@ test("a stroke count that goes backwards marks a new piece and later strokes are
   assert.equal(s.strokes.size, 5);
   assert.equal(s.strokes.get(5).recovery_time_s, 2, "the second copy fills the recovery time");
   s.feed(30, 0x0035, stroke(1, 30));
-  assert.ok(s.newPieceAt !== null);
-  assert.ok(events.includes("new_piece"));
   s.feed(34, 0x0035, stroke(2, 34));
-  assert.equal(s.strokes.size, 5, "nothing recorded after the new piece");
-  assert.equal(s.result({}).new_piece_started, true);
+  assert.equal(s.strokes.size, 7, "the second piece's strokes are recorded");
+  assert.ok(events.includes("piece"));
+  const r = s.result({});
+  assert.equal(r.pieces, 2);
+  assert.deepEqual(r.strokes.map(x => x.piece), [1, 1, 1, 1, 1, 2, 2]);
+  assert.deepEqual(r.strokes.map(x => x.stroke_count), [1, 2, 3, 4, 5, 1, 2]);
+  assert.deepEqual(r.strokes.map(x => x.key), [1, 2, 3, 4, 5, 6, 7], "records keep their arrival order");
+});
+
+test("daisy-chained pieces with summaries between them form one session", () => {
+  const le = (v, n) => Array.from({ length: n }, (_, i) => (v >> (8 * i)) & 0xff);
+  const stroke = (n, t) => Uint8Array.from([...le(t * 100, 3), ...le(t * 30, 3), 140, 80, ...le(200, 2), ...le(950, 2), ...le(1000, 2), ...le(500, 2), ...le(4000, 2), ...le(n, 2)]);
+  const summary = Uint8Array.from([...le(0, 2), ...le(0, 2), ...le(45000, 3), ...le(5000, 3), 30, 155, 142, 67, 162, 115, 0, 0, ...le(1100, 2)]);
+  const s = new Session(() => {});
+  for (let n = 1; n <= 4; n++) s.feed(n * 4, 0x0035, stroke(n, n * 4));
+  s.feed(50, 0x0039, summary);
+  for (let n = 1; n <= 4; n++) s.feed(100 + n * 4, 0x0035, stroke(n, n * 4));   // another Just Row, later
+  s.feed(150, 0x0039, summary);
+  const r = s.result({});
+  assert.equal(r.pieces, 2);
+  assert.equal(r.strokes.length, 8);
+  assert.deepEqual(r.strokes.map(x => x.piece), [1, 1, 1, 1, 2, 2, 2, 2]);
+  assert.equal(s.endAt, 150, "the latest summary holds the end");
+  s.feed(160, 0x0035, stroke(1, 160));   // a third Just Row starts
+  assert.equal(s.endAt, null, "strokes after a summary clear the end, so the recording carries on");
+  assert.equal(s.result({}).pieces, 3);
+});
+
+test("intervals of a programmed workout tag piece numbers while the state frames roll", () => {
+  const le = (v, n) => Array.from({ length: n }, (_, i) => (v >> (8 * i)) & 0xff);
+  const stroke = (n, t) => Uint8Array.from([...le(t * 100, 3), ...le(t * 30, 3), 140, 80, ...le(200, 2), ...le(950, 2), ...le(1000, 2), ...le(500, 2), ...le(4000, 2), ...le(n, 2)]);
+  const status = (t, state) => Uint8Array.from([...le(t * 100, 3), ...le(1234, 3), 5, 0, 1, state, 1, ...le(0, 3), ...le(45000, 3), 0x00, 113]);
+  const s = new Session(() => {});
+  s.feed(100, 0x0031, status(100, 4));   // interval_work_time
+  for (let n = 1; n <= 6; n++) s.feed(100 + n, 0x0035, stroke(n, n));
+  s.feed(110, 0x0031, status(110, 3));   // interval_rest
+  s.feed(120, 0x0031, status(120, 4));   // the next interval's work
+  for (let n = 1; n <= 6; n++) s.feed(120 + n, 0x0035, stroke(n, n));
+  const r = s.result({});
+  assert.equal(r.pieces, 2);
+  assert.deepEqual(r.strokes.map(x => x.piece), [1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2]);
 });
 
 test("uuid helper matches the Concept2 base", () => {
