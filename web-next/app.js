@@ -241,6 +241,15 @@ $("wo_spec").addEventListener("keydown", e => { if (e.key === "Enter") $("wo_sen
 $("wo_clear").addEventListener("click", () => program(null));
 
 // ---------- replay: the built-in sample, or a raw log you saved ----------
+/** A replay file named in the URL must exist here; a missing one said nothing useful
+ *  (the 404 page went to the JSON parser). Name the fix in the error instead. */
+async function fetchRow(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(r.status === 404
+    ? `no file named "${url}" on this site — use "replay a saved row" below and pick the log from this device`
+    : `fetch failed (${r.status})`);
+  return r.text();
+}
 async function playRaw(text, label, speed = 2) {
   if (state.pm || state.sample || state.logger) return;
   $("sample").disabled = true;
@@ -262,7 +271,7 @@ async function playRaw(text, label, speed = 2) {
   } catch (e) { setConn(`could not replay: ${e.message}`, "err"); }
   finally { state.sample = false; $("sample").disabled = false; }
 }
-const playSample = async () => playRaw(await (await fetch("examples/sample_row.jsonl")).text(), "the sample row (synthetic)");
+const playSample = async () => playRaw(await fetchRow("examples/sample_row.jsonl"), "the sample row (synthetic)");
 $("replayfile").addEventListener("change", async e => {
   const f = e.target.files && e.target.files[0]; if (!f) return;
   playRaw(await f.text(), f.name); e.target.value = "";
@@ -272,7 +281,7 @@ window.pm5Replay = playRaw;    // for recording the README animation from a save
 // README animation is recorded (headless Chrome, one frame per step of virtual time)
 (async () => {
   const q = new URLSearchParams(location.search), f = q.get("replay");
-  if (f && /^[\w.-]+$/.test(f)) playRaw(await (await fetch(f)).text(), q.get("label") || f, Number(q.get("speed")) || 1);
+  if (f && /^[\w.-]+$/.test(f)) playRaw(await fetchRow(f), q.get("label") || f, Number(q.get("speed")) || 1);
 })();
 
 // ---------- fitness settings and report ----------
