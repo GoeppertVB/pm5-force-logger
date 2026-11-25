@@ -3,7 +3,7 @@
 // answers are known, like curve.test.js's.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { strokeMeasures, pieceStats, piecesOverview, gateOk, GATES, resetCache } from "../pieces.js";
+import { strokeMeasures, pieceStats, piecesOverview, gateOk, GATES, resetCache, pieceAvg } from "../pieces.js";
 
 /** A flat-topped stroke curve (see curve.test.js's shape); hold = where the force lets go. */
 const curve = (n = 45, top = 110, hold = 0.7) => { const out = []; for (let i = 0; i < n; i++) { const x = i / (n - 1);
@@ -38,6 +38,13 @@ test("piecesOverview splits a session by piece tag; a missing tag reads as piece
   assert.deepEqual(rows.map(r => r.piece), [1, 2]);
   assert.equal(rows[0].n, 2);                                   // the untagged pair
   assert.ok(Math.abs(rows[1].len_cm - 152) < 1e-9);
+});
+
+test("pieceAvg: the mean of one field over the strokes given, null-safe", () => {
+  const ss = [stroke({ len_m: 1.50 }), stroke({ len_m: 1.54 }), stroke({ len_m: null })];
+  assert.ok(Math.abs(pieceAvg(ss, "drive_length_m") - 1.52) < 1e-9);
+  assert.equal(pieceAvg([stroke({})], "hr"), 150);
+  assert.equal(pieceAvg([], "drive_length_m"), null);
 });
 
 test("gates: length ≥150, peak ≤35, plateau ≥40; null fails quietly", () => {

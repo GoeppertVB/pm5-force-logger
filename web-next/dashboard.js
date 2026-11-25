@@ -2,7 +2,7 @@
 // table, fed through H (the event handlers): by the page's own Session when it holds the PM5,
 // or by the Python logger's server-sent events when the logger serves the page (logger-feed.js).
 import { trim, resample, metrics, smoothed, CM_PER_POINT } from "./curve.js";
-import { piecesOverview, gateOk, GATES, resetCache } from "./pieces.js";
+import { piecesOverview, gateOk, GATES, resetCache, pieceAvg } from "./pieces.js";
 export { trim, resample, metrics };
 export const S = { strokes: new Map(), status: {}, summary: {}, device: {}, splits: new Map(), hrSeen: null };   // hrSeen: the last heart rate and when
 // Stroke records are keyed session-wide (decode.js's Session.key); saved rows from before that
@@ -59,7 +59,7 @@ const n2 = v => v == null || Number.isNaN(v) ? "—" : v.toFixed(2);
 // ---------- tiles ----------
 const TILE_DEFS = [
   ["time", "Time"], ["dist", "Distance"], ["pace", "Pace /500m"], ["rate", "Rate"], ["power", "Power"], ["hr", "Heart rate"],
-  ["peak", "Peak force"], ["drive", "Drive"], ["ratio", "Drive : recovery"], ["stroke", "Per stroke"], ["drag", "Drag factor"], ["cal", "Calories"],
+  ["peak", "Peak force"], ["drive", "Drive"], ["drive_avg", "Drive average"], ["ratio", "Drive : recovery"], ["stroke", "Per stroke"], ["drag", "Drag factor"], ["cal", "Calories"],
 ];
 $("tiles").innerHTML = TILE_DEFS.map(([k, l]) => `<div class="tile" id="tile_${k}"><div class="label">${l}</div><div class="value" id="v_${k}">—</div><div class="sub" id="s_${k}"></div></div>`).join("");
 const setTile = (k, v, sub = "") => { $("v_" + k).textContent = v; $("s_" + k).textContent = sub; };
@@ -77,6 +77,10 @@ function renderTiles() {
   $("tile_hr").classList.toggle("stale", lostS != null);
   setTile("peak", last ? `${n0(last.peak_force_lbf)}` : "—", last ? `lbf · average ${n0(last.avg_force_lbf)}` : "");
   setTile("drive", last ? `${n2(last.drive_length_m)} m` : "—", last ? `${n2(last.drive_time_s)} s` : "");
+  // the current piece's running averages: the length focus, per piece (see pieces.js)
+  const pieceStrokes = last ? [...S.strokes.values()].filter(s => s.piece === last.piece) : [];
+  const pLen = pieceAvg(pieceStrokes, "drive_length_m"), pDt = pieceAvg(pieceStrokes, "drive_time_s");
+  setTile("drive_avg", pLen != null ? `${n2(pLen)} m` : "—", pLen != null ? `${n2(pDt)} s · ${pieceStrokes.length} strokes` : "waits for the piece");
   const prev = last ? S.strokes.get(skey(last) - 1) : null; const rec = last && (last.recovery_time_s ?? (prev && prev.recovery_time_s));
   setTile("ratio", last && rec ? `1 : ${n1(rec / last.drive_time_s)}` : "—", "target about 1 : 2");
   setTile("stroke", last ? `${n1(last.stroke_distance_m)} m` : "—", last ? `work ${n0(last.work_j)} J` : "");
@@ -247,7 +251,7 @@ const hidden = new Set();
 // rest is hidden and put after them until the display menu or a drag says otherwise. Hiding a
 // part changes only what is drawn: every stroke is still recorded and saved.
 const PHONE = matchMedia("(max-width: 640px)").matches;
-const PHONE_SHOWN = new Set(["tile_time", "tile_dist", "tile_pace", "tile_rate", "tile_hr", "tile_peak", "panel_curve", "setup", "guided", "sessions"]);
+const PHONE_SHOWN = new Set(["tile_time", "tile_dist", "tile_pace", "tile_rate", "tile_hr", "tile_peak", "tile_drive", "tile_drive_avg", "panel_curve", "setup", "guided", "sessions"]);
 const PHONE_ORDER = ["tiles", "main", "guided", "setup", "more", "trends", "tablewrap"];
 function loadUI() { try { return JSON.parse(localStorage.getItem("pm5_display")) || {}; } catch { return {}; } }
 const uiValue = k => { const el = $("ui_" + k); const v = el ? parseFloat(el.value) : NaN; return Number.isNaN(v) ? UI[k][1] : v; };

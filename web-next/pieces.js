@@ -37,6 +37,11 @@ export function strokeMeasures(s) {
 
 const avg = a => { const v = a.filter(x => x != null); return v.length ? v.reduce((x, y) => x + y, 0) / v.length : null; };
 
+/** The mean of one stroke field over the strokes given (the current piece's strokes). */
+export function pieceAvg(strokes, field) {
+  return avg(strokes.map(s => s[field]));
+}
+
 /** One piece's averages from its strokes (their cached measures). */
 export function pieceStats(strokes, piece) {
   const ms = strokes.map(measures);
