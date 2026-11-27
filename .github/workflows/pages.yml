@@ -1,15 +1,11 @@
 name: pages
 
 # Publishes web/ (the browser version) to GitHub Pages on every push to main, at the site
-# root. While web-next/ exists (the piece-panel experiment), a copy of it is published
-# beside the stable version at /next/, so both stay reachable in the browser:
-#   /        = the stable dashboard (web/)
-#   /next/   = the piece-panel dashboard (web-next/)
-# The repository's Pages source must be set to "GitHub Actions" once, under Settings > Pages.
+# root. The repository's Pages source must be set to "GitHub Actions" once, under Settings > Pages.
 on:
   push:
     branches: [main]
-    paths: ["web/**", "web-next/**", "workouts.json", "examples/sample_row.jsonl", ".github/workflows/pages.yml"]
+    paths: ["web/**", "workouts.json", "examples/sample_row.jsonl", ".github/workflows/pages.yml"]
   workflow_dispatch:
 
 permissions:
@@ -34,11 +30,6 @@ jobs:
           mkdir site
           cp -RL web/. site/
           rm -rf site/tests site/package.json
-          if [ -d web-next ]; then
-            mkdir -p site/next
-            cp -RL web-next/. site/next/
-            rm -rf site/next/tests site/next/package.json
-          fi
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

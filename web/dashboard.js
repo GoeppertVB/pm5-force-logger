@@ -2,6 +2,7 @@
 // table, fed through H (the event handlers): by the page's own Session when it holds the PM5,
 // or by the Python logger's server-sent events when the logger serves the page (logger-feed.js).
 import { trim, resample, metrics, smoothed, CM_PER_POINT } from "./curve.js";
+import { piecesOverview, gateOk, GATES, resetCache, pieceAvg } from "./pieces.js";
 export { trim, resample, metrics };
 export const S = { strokes: new Map(), status: {}, summary: {}, device: {}, splits: new Map(), hrSeen: null };   // hrSeen: the last heart rate and when
 // Stroke records are keyed session-wide (decode.js's Session.key); saved rows from before that
@@ -58,7 +59,7 @@ const n2 = v => v == null || Number.isNaN(v) ? "—" : v.toFixed(2);
 // ---------- tiles ----------
 const TILE_DEFS = [
   ["time", "Time"], ["dist", "Distance"], ["pace", "Pace /500m"], ["rate", "Rate"], ["power", "Power"], ["hr", "Heart rate"],
-  ["peak", "Peak force"], ["drive", "Drive"], ["ratio", "Drive : recovery"], ["stroke", "Per stroke"], ["drag", "Drag factor"], ["cal", "Calories"],
+  ["peak", "Peak force"], ["drive", "Drive"], ["drive_avg", "Drive average"], ["ratio", "Drive : recovery"], ["stroke", "Per stroke"], ["drag", "Drag factor"], ["cal", "Calories"],
 ];
 $("tiles").innerHTML = TILE_DEFS.map(([k, l]) => `<div class="tile" id="tile_${k}"><div class="label">${l}</div><div class="value" id="v_${k}">—</div><div class="sub" id="s_${k}"></div></div>`).join("");
 const setTile = (k, v, sub = "") => { $("v_" + k).textContent = v; $("s_" + k).textContent = sub; };
@@ -76,6 +77,10 @@ function renderTiles() {
   $("tile_hr").classList.toggle("stale", lostS != null);
   setTile("peak", last ? `${n0(last.peak_force_lbf)}` : "—", last ? `lbf · average ${n0(last.avg_force_lbf)}` : "");
   setTile("drive", last ? `${n2(last.drive_length_m)} m` : "—", last ? `${n2(last.drive_time_s)} s` : "");
+  // the current piece's running averages: the length focus, per piece (see pieces.js)
+  const pieceStrokes = last ? [...S.strokes.values()].filter(s => s.piece === last.piece) : [];
+  const pLen = pieceAvg(pieceStrokes, "drive_length_m"), pDt = pieceAvg(pieceStrokes, "drive_time_s");
+  setTile("drive_avg", pLen != null ? `${n2(pLen)} m` : "—", pLen != null ? `${n2(pDt)} s · ${pieceStrokes.length} strokes` : "waits for the piece");
   const prev = last ? S.strokes.get(skey(last) - 1) : null; const rec = last && (last.recovery_time_s ?? (prev && prev.recovery_time_s));
   setTile("ratio", last && rec ? `1 : ${n1(rec / last.drive_time_s)}` : "—", "target about 1 : 2");
   setTile("stroke", last ? `${n1(last.stroke_distance_m)} m` : "—", last ? `work ${n0(last.work_j)} J` : "");
@@ -205,8 +210,30 @@ function renderTable() {
     return `<tr><td>${skey(s)}${s.piece > 1 ? ` (p${s.piece})` : ""}</td><td>${n2(s.drive_length_m)}</td><td>${n2(s.drive_time_s)}</td><td>${n2(s.recovery_time_s)}</td><td>${ratio}</td><td>${n2(s.stroke_distance_m)}</td><td>${n0(s.peak_force_lbf)}</td><td>${n0(s.avg_force_lbf)}</td><td>${n0(s.work_j)}</td><td>${n0(s.power_w)}</td><td>${m ? m.a100 + "%" : "—"}</td><td>${m ? n0(m.ram) + "%" : "—"}</td><td>${s.hr ? s.hr : "—"}</td></tr>`; }).join("");
 }
 
+// One row per piece (the monitor's own piece boundaries, decode.js): the current piece's
+// running averages land while you row, the previous piece's stay beside them, and the
+// length/peak/plateau cells take the W2 gate colours. Cached per stroke; see pieces.js.
+function renderPieces() {
+  const el = $("pieces"); if (!el) return;
+  const all = [...S.strokes.values()];
+  if (!all.length) { el.querySelector("tbody").innerHTML = `<tr><td colspan="9" style="text-align:left; color:var(--ink3)">One row per piece the monitor starts; the current piece's averages land here while you row.</td></tr>`; return; }
+  const rows = piecesOverview(all);
+  const cur = rows[rows.length - 1], prev = rows.length > 1 ? rows[rows.length - 2] : null;
+  const cls = (k, v) => v == null ? "" : gateOk(k, v) ? "ok" : "off";
+  const f1 = v => v == null ? "—" : v.toFixed(1);
+  const dLen = cur && prev && cur.len_cm != null && prev.len_cm != null ? cur.len_cm - prev.len_cm : null;
+  el.querySelector("tbody").innerHTML = rows.map(r => `<tr${r === cur ? ` class="cur"` : ""}>` +
+    `<td>${r === cur ? "▸ " : ""}${r.piece}</td><td>${r.n}</td>` +
+    `<td class="gate ${cls("len_cm", r.len_cm)}">${f1(r.len_cm)}${r === cur && dLen != null ? `<span class="delta"> ${dLen >= 0 ? "+" : ""}${dLen.toFixed(1)}</span>` : ""}</td>` +
+    `<td>${r.power_w == null ? "—" : Math.round(r.power_w)}</td><td>${f1(r.spm)}</td>` +
+    `<td class="gate ${cls("peak_pos", r.peak_pos)}">${f1(r.peak_pos)}</td>` +
+    `<td class="gate ${cls("plateau", r.plateau)}">${f1(r.plateau)}</td>` +
+    `<td>${r.fp == null ? "—" : r.fp.toFixed(2)}</td><td>${r.hr == null ? "—" : Math.round(r.hr)}</td></tr>`).join("");
+  $("panel_pieces").querySelector(".note").textContent = `piece ${cur.piece}: ${cur.n} strokes · gates — length ${GATES.len_cm.label}, peak ${GATES.peak_pos.label}, plateau ${GATES.plateau.label}`;
+}
+
 let pending = false;
-export function render() { if (pending) return; pending = true; requestAnimationFrame(() => { pending = false; renderTiles(); drawCurve(); renderMetrics(); drawTrends(); renderTable(); renderSplits(); }); }
+export function render() { if (pending) return; pending = true; requestAnimationFrame(() => { pending = false; renderTiles(); drawCurve(); renderMetrics(); drawTrends(); renderTable(); renderSplits(); renderPieces(); }); }
 window.addEventListener("resize", render);
 
 // ---------- display: sizes and what is shown, remembered per browser ----------
@@ -224,7 +251,7 @@ const hidden = new Set();
 // rest is hidden and put after them until the display menu or a drag says otherwise. Hiding a
 // part changes only what is drawn: every stroke is still recorded and saved.
 const PHONE = matchMedia("(max-width: 640px)").matches;
-const PHONE_SHOWN = new Set(["tile_time", "tile_dist", "tile_pace", "tile_rate", "tile_hr", "tile_peak", "panel_curve", "setup", "guided", "sessions"]);
+const PHONE_SHOWN = new Set(["tile_time", "tile_dist", "tile_pace", "tile_rate", "tile_hr", "tile_peak", "tile_drive", "tile_drive_avg", "panel_curve", "setup", "guided", "sessions"]);
 const PHONE_ORDER = ["tiles", "main", "guided", "setup", "more", "trends", "tablewrap"];
 function loadUI() { try { return JSON.parse(localStorage.getItem("pm5_display")) || {}; } catch { return {}; } }
 const uiValue = k => { const el = $("ui_" + k); const v = el ? parseFloat(el.value) : NaN; return Number.isNaN(v) ? UI[k][1] : v; };
@@ -236,7 +263,7 @@ const ON_SCREENS = new Set($("screen_today") ? ["setup", "guided", "fitness", "s
 function partGroups() {
   return [["Tiles", TILE_DEFS.map(([k, l]) => ["tile_" + k, l])],
           ["Charts", [["panel_curve", "Force curve"], ["panel_shape", "Curve shape"], ...TRENDS.map((t, i) => ["trend" + i, t[0].replace(/ \(.*/, "")])]],
-          ["Sections", [["setup", "Set up the PM5"], ["guided", "Guided session"], ["tablewrap", "Stroke table"], ["fitness", "Fitness panel"], ["sessions", "Saved rows"]]]]
+          ["Sections", [["setup", "Set up the PM5"], ["guided", "Guided session"], ["panel_pieces", "Piece averages"], ["tablewrap", "Stroke table"], ["fitness", "Fitness panel"], ["sessions", "Saved rows"]]]]
     .map(([g, items]) => [g, items.filter(([id]) => $(id) && !ON_SCREENS.has(id))]).filter(([, items]) => items.length);
 }
 const allParts = () => partGroups().flatMap(([, items]) => items);
@@ -423,9 +450,9 @@ $("saveref").addEventListener("click", () => {
 // ---------- the event handlers the session feeds ----------
 export const H = {
   snapshot: d => { S.hrSeen = null; S.strokes.clear(); d.strokes.forEach(s => S.strokes.set(skey(s), s)); S.status = d.status || {}; S.summary = d.summary || {};
-    S.splits.clear(); (d.splits || []).forEach(sp => S.splits.set(`${sp.piece ?? 1}:${sp.split_number}`, sp)); },
+    S.splits.clear(); (d.splits || []).forEach(sp => S.splits.set(`${sp.piece ?? 1}:${sp.split_number}`, sp)); resetCache(); },
   split: d => { S.splits.set(`${d.piece ?? 1}:${d.split_number}`, { ...d }); },
-  reset: d => { S.strokes.clear(); S.splits.clear(); S.status = {}; S.summary = {}; S.hrSeen = null; $("banner").textContent = d && d.replay ? `replaying ${d.replay}` : ""; },
+  reset: d => { S.strokes.clear(); S.splits.clear(); S.status = {}; S.summary = {}; S.hrSeen = null; resetCache(); $("banner").textContent = d && d.replay ? `replaying ${d.replay}` : ""; },
   device: d => { S.device = d; $("banner").textContent = `${d.name || "PM5"}${d.firmware_rev ? " · firmware " + d.firmware_rev : ""}${d.workout ? " · " + d.workout : ""}`; },
   status: d => { S.status = d; if (d.hr) S.hrSeen = { hr: d.hr, at: Date.now() }; },
   stroke: d => { S.strokes.set(d.key ?? d.stroke_count, d); },

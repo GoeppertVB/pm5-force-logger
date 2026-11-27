@@ -53,6 +53,10 @@
   .metrics .note { grid-column: 1 / -1; font-size: .88rem; color: var(--ink3); margin: -2px 0 8px; }
   .flag { font-size: .94rem; font-weight: 600; }
   .flag.ok { color: var(--good); } .flag.off { color: var(--warn); }
+  #pieces td.gate.ok { color: var(--good); } #pieces td.gate.off { color: var(--warn); }
+  #pieces tr.cur td { background: rgba(57,135,229,.10); }
+  #pieces .delta { font-size: .78em; color: var(--ink3); }
+  #panel_pieces .note { margin: 8px 0 0; }
   .trends { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; padding: 0 20px 12px; }
   .trends canvas { height: var(--trend-h); }
   table { width: 100%; border-collapse: collapse; font-size: .88rem; font-variant-numeric: tabular-nums; }
@@ -339,6 +343,12 @@
       <label>RP3 bands <select id="bands"><option value="off">off</option><option value="men">men</option><option value="women">women</option></select></label>
       <label>mass <input type="number" id="mass" min="30" max="200" step="0.5" style="width: 5em" title="Body mass in kg, for work and force per kilogram"> kg</label></div></div>
     <div class="metrics" id="metrics"></div>
+  <div class="panel" id="panel_pieces">
+    <h2>Pieces</h2>
+    <table id="pieces"><thead><tr>
+      <th>Piece</th><th>Strokes</th><th>Len cm</th><th>W</th><th>spm</th><th>Peak pos</th><th>Plateau</th><th>FP</th><th>HR</th>
+    </tr></thead><tbody></tbody></table>
+    <p class="note"></p>
   </div>
 </main>
 <section class="trends" id="trends"></section>
